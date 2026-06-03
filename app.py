@@ -595,10 +595,19 @@ def _scan_color(img, bright, contrast):
       3) recolor by scaling B/G/R with the same per-pixel luminance gain, which preserves
          hue & saturation — red stamps stay red, they don't get blackened.
     """
-    b, g, r = cv2.split(img.astype(np.float32))
+    imgf = img.astype(np.float32)
+    b, g, r = cv2.split(imgf)
     lum = 0.114 * b + 0.587 * g + 0.299 * r
     bg = np.maximum(_estimate_background(lum), 1.0)
     flat = np.clip(lum / bg, 0.0, 1.3)                     # paper -> ~1.0, ink -> low
+
+    # Confident-background mask from the CLEAN divided signal (taken BEFORE CLAHE, which would
+    # otherwise amplify subtle sheen into false detail): pixels within ~10% of the local paper
+    # level AND low-chroma = paper / haze / bleed-through / plastic-bag sheen. Forced to pure
+    # white at the very end, so the background is clean regardless of substrate, while real ink
+    # (much darker -> low flat) and colored stamps (high chroma) are left untouched.
+    chroma0 = imgf.max(axis=2) - imgf.min(axis=2)
+    bg_mask = (flat > 0.90) & (chroma0 < 40.0)
 
     # Local contrast equalization (CLAHE): lift faint/soft regions — e.g. the foreshortened,
     # softly-focused top of an angled photo — to the contrast of the sharp regions, so
@@ -629,7 +638,8 @@ def _scan_color(img, bright, contrast):
     achroma = np.clip((60.0 - chroma) / 60.0, 0.0, 1.0)    # 1 = neutral paper, 0 = saturated ink
     wpaper = (bright * achroma)[..., None]                 # whiten bright low-chroma paper only
     out = out * (1.0 - wpaper) + 255.0 * wpaper            # (slightly cyan/yellow paper -> white)
-    return np.clip(out, 0, 255).astype(np.uint8)
+    out[bg_mask] = 255.0                                   # hard-whiten confident background: wipes
+    return np.clip(out, 0, 255).astype(np.uint8)           # haze / bleed-through / bag sheen
 
 
 def _sauvola_mask(gray, window=25, k=0.2, r=128.0):
