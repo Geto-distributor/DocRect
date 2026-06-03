@@ -660,11 +660,18 @@ def _red_mask(img):
     (R~80, B~50) where r-b is only ~30, but its hue is unmistakably red."""
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-    # generous saturation floor so the seal's lighter / anti-aliased red is included; NO open
-    # (it erodes the thin stamp strokes away), then close + dilate to cover the full stroke halo.
-    m = (((h <= 12) | (h >= 168)) & (s >= 45) & (v >= 50)).astype(np.uint8) * 255
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))  # bridge the ring's strokes
-    return cv2.dilate(m, np.ones((3, 3), np.uint8))                      # cover the anti-aliased halo
+    # LAB a* (red-green axis, 128 = neutral) is the robust redness signal: a dark maroon
+    # stamp core keeps a high a* even though its HSV saturation is low, so a* catches the
+    # part hue/saturation misses — while neutral black ink (a* ~128) is left alone. Combine
+    # with an HSV hue test for bright reds. v>=40 excludes near-black so real ink survives.
+    a = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[..., 1]
+    hue_red = ((h <= 12) | (h >= 168)) & (s >= 40)
+    m = (((hue_red) | (a >= 138)) & (v >= 40)).astype(np.uint8) * 255
+    # NO open (it erodes thin strokes). a* already catches the maroon core directly, so only a
+    # moderate close is needed to bridge the ring's strokes — kept small to limit collateral
+    # whitening of black text the stamp overlaps. Dilate covers the anti-aliased halo.
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((13, 13), np.uint8))
+    return cv2.dilate(m, np.ones((3, 3), np.uint8))
 
 
 def _enhance(img, bright, contrast, detail, enhance_mode, remove_red=False):
