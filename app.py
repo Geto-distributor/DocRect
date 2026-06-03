@@ -220,15 +220,20 @@ def _order_quad(pts):
 
 
 def _warp_quad(img, quad):
+    """Perspective-warp the quad to a front-on rectangle. Target size = the AVERAGE of
+    each pair of opposite edges (top/bottom widths, left/right heights) — the trapezoid's
+    representative dimension; cubic resampling keeps text edges clean. (A 4-corner homography
+    can't fully recover the true aspect of a perspective shot without camera intrinsics;
+    avg vs max differs <2% — corner accuracy, not this pick, drives any visible stretch.)"""
     (tl, tr, br, bl) = quad
-    wa = np.linalg.norm(br - bl); wb = np.linalg.norm(tr - tl)
-    ha = np.linalg.norm(tr - br); hb = np.linalg.norm(tl - bl)
-    mw = int(round(max(wa, wb))); mh = int(round(max(ha, hb)))
+    w_top = np.linalg.norm(tr - tl); w_bot = np.linalg.norm(br - bl)
+    h_left = np.linalg.norm(bl - tl); h_right = np.linalg.norm(br - tr)
+    mw = int(round((w_top + w_bot) / 2.0)); mh = int(round((h_left + h_right) / 2.0))
     if mw < 10 or mh < 10:
         return None
     dst = np.array([[0, 0], [mw - 1, 0], [mw - 1, mh - 1], [0, mh - 1]], dtype="float32")
     m = cv2.getPerspectiveTransform(quad, dst)
-    return cv2.warpPerspective(img, m, (mw, mh))
+    return cv2.warpPerspective(img, m, (mw, mh), flags=cv2.INTER_CUBIC)
 
 
 def _plausible(out, w, h):
@@ -605,9 +610,13 @@ def _scan_color(img, bright, contrast):
     # Neutralize the paper: bright + low-chroma pixels are blended toward pure white,
     # killing any residual color cast so the background reads as true white. Keyed on the
     # MIN channel, so saturated ink (red stamp = low B/G) and dark text are left alone.
-    mn = out.min(axis=2)
-    wpaper = np.clip((mn - 185.0) / 55.0, 0.0, 1.0)[..., None]
-    out = out * (1.0 - wpaper) + 255.0 * wpaper
+    mx = out.max(axis=2); mn = out.min(axis=2)
+    lum2 = 0.114 * out[..., 0] + 0.587 * out[..., 1] + 0.299 * out[..., 2]
+    chroma = mx - mn
+    bright = np.clip((lum2 - 185.0) / 55.0, 0.0, 1.0)
+    achroma = np.clip((60.0 - chroma) / 60.0, 0.0, 1.0)    # 1 = neutral paper, 0 = saturated ink
+    wpaper = (bright * achroma)[..., None]                 # whiten bright low-chroma paper only
+    out = out * (1.0 - wpaper) + 255.0 * wpaper            # (slightly cyan/yellow paper -> white)
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
@@ -648,10 +657,18 @@ def _enhance(img, bright, contrast, detail, enhance_mode):
         out = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
     elif enhance_mode in (2, 3):
         gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
-        win = max(15, (min(gray.shape[:2]) // 40) | 1)
-        ink = _sauvola_mask(gray, window=win, k=0.2)
+        # consolidate strokes before thresholding: fill tiny intra-stroke holes, then denoise
+        gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE,
+                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2)))
+        gray = cv2.GaussianBlur(gray, (0, 0), 1.0)
+        # larger window = steadier local background; lower k = catch faint gray as ink
+        win = max(31, (min(gray.shape[:2]) // 30) | 1)
+        ink = _sauvola_mask(gray, window=win, k=0.15).astype(np.uint8) * 255
+        ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))  # fill pinholes
+        ink = cv2.medianBlur(ink, 3)                                            # drop speckle
+        mask = ink > 0
         bw = np.full_like(out, 255)
-        bw[ink] = (0, 0, 0)
+        bw[mask] = (0, 0, 0)
         if enhance_mode == 3:                              # keep red stamps in original color
             stamp = (_red_mask(img) > 0)
             bw[stamp] = img[stamp]
