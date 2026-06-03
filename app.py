@@ -233,7 +233,11 @@ def _warp_quad(img, quad):
         return None
     dst = np.array([[0, 0], [mw - 1, 0], [mw - 1, mh - 1], [0, mh - 1]], dtype="float32")
     m = cv2.getPerspectiveTransform(quad, dst)
-    return cv2.warpPerspective(img, m, (mw, mh), flags=cv2.INTER_CUBIC)
+    # Fill out-of-source areas with WHITE (not the default black): when the quad/best-fit
+    # rectangle reaches past the image edge, those pixels blend into the white paper instead
+    # of leaving black wedges in the corners (which the enhancer would otherwise keep as ink).
+    return cv2.warpPerspective(img, m, (mw, mh), flags=cv2.INTER_CUBIC,
+                               borderMode=cv2.BORDER_CONSTANT, borderValue=(255, 255, 255))
 
 
 def _plausible(out, w, h):
@@ -558,9 +562,12 @@ def _rectify_document(img):
     # Flat-on but tilted page -> snap to its best-fit rectangle so the warp is a pure rotation
     # (no text shear); keep the raw quad only for genuine perspective (keystone) shots.
     box = _near_rect_box(quad)
-    print(f"[rectify] near_rect_snap={box is not None}", flush=True)
     if box is not None:
         quad = box
+    # Shrink the crop ~1.5% inward so it lands just INSIDE the page edge, dropping the thin
+    # desk / edge-shadow sliver the detected corners tend to include (which the enhancer would
+    # darken to a black border). Documents have margins, so this clips no content.
+    quad = _expand_quad(quad, -0.015)
     warped = _warp_quad(img, quad)
     return warped if warped is not None and _plausible(warped, w, h) else None
 
