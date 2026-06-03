@@ -618,8 +618,8 @@ def _scan_color(img, bright, contrast):
     f8 = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(f8)
     flat = f8.astype(np.float32) / 200.0
 
-    pivot = 0.78 - contrast / 500.0                        # below pivot darkens, above whitens
-    strength = 2.6 + contrast / 40.0
+    pivot = 0.70 - contrast / 500.0                        # below pivot darkens, above whitens
+    strength = 3.6 + contrast / 40.0                       # stronger base -> bold, ink-black text
     new_lum = np.clip((flat - pivot) * strength + 1.0, 0.0, 1.0) * 255.0 + float(bright)
     new_lum = np.clip(new_lum, 0.0, 255.0)
 
@@ -694,8 +694,8 @@ def _enhance(img, bright, contrast, detail, enhance_mode, remove_red=False):
     stamp kept. removeStamp=1 whitens all red ink (seal + red handwriting) in any mode."""
     out = _scan_color(img, bright, contrast)
 
-    # detail / sharpen via unsharp mask (-1 = auto mild)
-    amount = 0.6 if detail == -1 else max(0.0, detail / 100.0)
+    # detail / sharpen via unsharp mask (-1 = auto; stronger default for crisp text edges)
+    amount = 0.9 if detail == -1 else max(0.0, detail / 100.0)
     if amount > 0:
         blur = cv2.GaussianBlur(out, (0, 0), 3)
         out = cv2.addWeighted(out, 1 + amount, blur, -amount, 0)
