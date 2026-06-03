@@ -628,8 +628,14 @@ def _scan_color(img, bright, contrast):
     # brightness, so for those pixels target a lifted luminance -> the seal stays vivid, not dark.
     a_red = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[..., 1].astype(np.float32)
     colorness = np.clip((a_red - 138.0) / 30.0, 0.0, 1.0)
-    lum_keep = np.clip(lum * 1.15 + 45.0, 0.0, 255.0)
-    new_lum = new_lum * (1.0 - colorness) + lum_keep * colorness
+    # Treat red and black as separate ink layers: only LIFT the seal's OWN red ink (mid/bright
+    # luminance) to make it vivid; do NOT lift the dark BLACK TEXT the seal overlaps (low
+    # luminance) — that keeps the ink-darkening tone curve and stays black & readable THROUGH
+    # the stamp (so the stamp need not be removed to read what's under it).
+    is_seal_ink = np.clip((lum - 70.0) / 40.0, 0.0, 1.0)   # 0 = dark text under seal, 1 = seal's red ink
+    lift = colorness * is_seal_ink
+    lum_keep = np.clip(lum * 1.2 + 45.0, 0.0, 255.0)
+    new_lum = new_lum * (1.0 - lift) + lum_keep * lift
 
     gain = np.clip(new_lum / np.maximum(lum, 1.0), 0.0, 4.0)
     out = cv2.merge([np.clip(b * gain, 0, 255),
