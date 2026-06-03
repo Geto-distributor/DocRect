@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.log
+.venv/
+venv/
+# model weights are large — fetch per models/README.md, don't commit
+*.onnx
+models/*.onnx
+# build / IDE
+obj/
+bin/
+.idea/
+.vscode/
+# OmniX C# integration is NOT part of this repo (it lives in the OmniX repo)
+omnix-integration/
