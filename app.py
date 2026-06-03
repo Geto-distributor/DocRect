@@ -597,8 +597,17 @@ def _scan_color(img, bright, contrast):
     bg = np.maximum(_estimate_background(lum), 1.0)
     flat = np.clip(lum / bg, 0.0, 1.3)                     # paper -> ~1.0, ink -> low
 
-    pivot = 0.80 - contrast / 500.0                        # below pivot darkens, above whitens
-    strength = 2.4 + contrast / 40.0
+    # Local contrast equalization (CLAHE): lift faint/soft regions — e.g. the foreshortened,
+    # softly-focused top of an angled photo — to the contrast of the sharp regions, so
+    # light-gray text reads as black instead of washing out. Per-tile, so it adapts to
+    # spatially varying ink density; the background mottling it adds is wiped by the
+    # near-white neutralization below.
+    f8 = np.clip(flat * 200.0, 0, 255).astype(np.uint8)
+    f8 = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(f8)
+    flat = f8.astype(np.float32) / 200.0
+
+    pivot = 0.78 - contrast / 500.0                        # below pivot darkens, above whitens
+    strength = 2.6 + contrast / 40.0
     new_lum = np.clip((flat - pivot) * strength + 1.0, 0.0, 1.0) * 255.0 + float(bright)
     new_lum = np.clip(new_lum, 0.0, 255.0)
 
