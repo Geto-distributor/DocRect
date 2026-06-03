@@ -37,6 +37,11 @@ cv2.setNumThreads(int(os.environ.get("DOCRECT_CV_THREADS", "6")))
 _OCR_MAXSIDE = int(os.environ.get("DOCRECT_OCR_MAXSIDE", "2048"))
 _DOC_MAXSIDE = int(os.environ.get("DOCRECT_DOC_MAXSIDE", "2560"))
 
+# UVDoc geometric dewarp inside the OCR pipeline: ON by default in PaddleX, but it ~doubles
+# OCR latency for marginal/mixed accuracy at a sane resolution (our own rectify handles
+# perspective better). Off by default; orientation + textline-orientation stay on.
+_OCR_USE_UNWARP = os.environ.get("DOCRECT_OCR_UNWARP", "0") == "1"
+
 DEVICE = "gpu:0"
 _OCR = None
 _TABLE = None
@@ -130,7 +135,7 @@ async def ocr(request: Request, file: Optional[UploadFile] = File(None)):
     ocr_pl, _, _ = _pipelines()
 
     res = None
-    for r in ocr_pl.predict(proc, return_word_box=True):
+    for r in ocr_pl.predict(proc, return_word_box=True, use_doc_unwarping=_OCR_USE_UNWARP):
         res = r.json["res"]
         break
 
