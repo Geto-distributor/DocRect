@@ -567,7 +567,7 @@ def _rectify_document(img):
     # Shrink the crop ~1.5% inward so it lands just INSIDE the page edge, dropping the thin
     # desk / edge-shadow sliver the detected corners tend to include (which the enhancer would
     # darken to a black border). Documents have margins, so this clips no content.
-    quad = _expand_quad(quad, -0.015)
+    quad = _expand_quad(quad, -0.02)
     warped = _warp_quad(img, quad)
     return warped if warped is not None and _plausible(warped, w, h) else None
 
@@ -798,6 +798,35 @@ def _enhance(img, bright, contrast, detail, enhance_mode, remove_red=False):
     return out
 
 
+def _whiten_dark_border(img, max_frac=0.045, dark_thresh=110, band_frac=0.18):
+    """Whiten dark border lines/bands the crop left behind (paper edge, desk / edge-shadow
+    sliver the enhancer darkened). Only the OUTER MARGIN (first max_frac of each side) is
+    touched — that zone holds no text — and within it we whiten from the edge up to the
+    DEEPEST row/col carrying a dark band (>=band_frac dark). This catches a paper-edge line
+    even when a thin white sliver sits outside it (which a plain edge-scan would stop at),
+    while the text body, which starts past the margin, is never reached."""
+    h, w = img.shape[:2]
+    dark = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) < dark_thresh
+    rlim, clim = int(h * max_frac), int(w * max_frac)
+
+    def deepest(frac_at, lim):
+        d = -1
+        for i in range(lim):
+            if frac_at(i) >= band_frac:
+                d = i
+        return d
+
+    t = deepest(lambda i: dark[i].mean(), rlim)
+    b = deepest(lambda i: dark[h - 1 - i].mean(), rlim)
+    l = deepest(lambda i: dark[:, i].mean(), clim)
+    r = deepest(lambda i: dark[:, w - 1 - i].mean(), clim)
+    if t >= 0: img[:t + 1] = 255
+    if b >= 0: img[h - b - 1:] = 255
+    if l >= 0: img[:, :l + 1] = 255
+    if r >= 0: img[:, w - r - 1:] = 255
+    return img
+
+
 def _orient(img):
     """Detect 0/90/180/270 rotation and bring the page upright (cv2 rotate)."""
     try:
@@ -901,6 +930,8 @@ async def doc_correct(
 
     # 3) photometric enhancement
     img = _enhance(img, bright, contrast, detail, enhance_mode, remove_red=bool(remove_red))
+    # 4) whiten any dark border band the crop left (desk / edge-shadow sliver -> black)
+    img = _whiten_dark_border(img)
 
     ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
     if not ok:
