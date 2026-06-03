@@ -36,10 +36,17 @@ packages, and screenshots alike — and **never clips content**:
    mask spikes), then convex-hull 4-vertex corners.
 3. Candidate masks for the fallback: HSV bright/low-saturation + deep **ISNet** salient
    mask (rembg), pick the most rectangular; masks are spike-cleaned (morphological open).
-4. Perspective warp → orientation (0/90/180/270) → cheap text-block deskew →
-   **scan enhancement**: per-channel shadow removal (white background) + strong contrast
-   (black text) + sharpen, **color-preserving** (red stamps survive).
+4. Perspective warp → orientation (0/90/180/270) → **text-line deskew** (maximize the
+   horizontal-projection variance of the ink map over small angles — a whole-page
+   statistic, robust where a `minAreaRect` on dark pixels drifts) →
+   **scan enhancement**: divide luminance by its background field to flatten shadows
+   (paper → white), a tone curve that deepens ink and clips paper to pure white while
+   keeping gradients (anti-aliased, no jaggies), hue-preserving recolor + near-white
+   neutralization so the background is true white and **red stamps survive**.
 5. No document found → enhance only (never distorts).
+
+`enhanceMode`: `0` color scan (default) · `1` grayscale · `2` binarized B/W (Sauvola,
+integral-image — no scikit-image) · `3` binarized but red stamps kept in color.
 
 Detection runs on a downscaled copy; the full-res image is warped once. Warm latency is
 sub-second to ~1s even on 24 MP photos (all inference on GPU).

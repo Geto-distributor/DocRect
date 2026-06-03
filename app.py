@@ -530,73 +530,132 @@ def _rectify_document(img):
 
 
 def _deskew_textlines(img):
-    """Fine residual deskew via the text block's orientation (dark-pixel minAreaRect).
-    Cheap (no OCR); only acts on a small real skew, no-op when already aligned."""
+    """Fine residual deskew by maximizing the horizontal-projection variance of the ink
+    map: when text lines are level the row-sum profile is sharply peaked (high variance),
+    so we search small angles for the peak. Robust to noise/strokes/punctuation (whole-page
+    statistic, unlike a minAreaRect on dark pixels). The angle search runs on a downscaled
+    binary (cheap); the found angle is applied once to the full-res image. No-op when the
+    page is already level, skipped when the result is implausible."""
     try:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        _, th = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        h, w = gray.shape[:2]
+        s = 1000.0 / max(h, w) if max(h, w) > 1000 else 1.0
+        small = cv2.resize(gray, (max(1, round(w * s)), max(1, round(h * s))),
+                           interpolation=cv2.INTER_AREA) if s < 1.0 else gray
+        _, th = cv2.threshold(small, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
         th = cv2.medianBlur(th, 3)
-        pts = cv2.findNonZero(th)
-        if pts is None or len(pts) < 50:
+        if cv2.countNonZero(th) < 50:
             return img
-        ang = cv2.minAreaRect(pts)[2]
-        if ang < -45:
-            ang += 90
-        elif ang > 45:
-            ang -= 90
-        if abs(ang) < 0.3 or abs(ang) > 20:   # already aligned, or implausible -> skip
+        sh, sw = th.shape[:2]
+        center = (sw / 2.0, sh / 2.0)
+
+        def variance_at(angle):
+            m = cv2.getRotationMatrix2D(center, float(angle), 1.0)
+            rot = cv2.warpAffine(th, m, (sw, sh), flags=cv2.INTER_NEAREST, borderValue=0)
+            proj = np.sum(rot, axis=1, dtype=np.float64)
+            return float(np.var(proj))
+
+        coarse = np.arange(-4.0, 4.001, 0.4)
+        best = max(coarse, key=variance_at)
+        fine = np.arange(best - 0.4, best + 0.401, 0.05)
+        best = float(max(fine, key=variance_at))
+        if abs(best) < 0.1 or abs(best) > 8.0:   # already level, or implausible -> skip
             return img
-        h, w = img.shape[:2]
-        m = cv2.getRotationMatrix2D((w / 2, h / 2), ang, 1.0)
-        return cv2.warpAffine(img, m, (w, h), flags=cv2.INTER_LINEAR, borderValue=(255, 255, 255))
+        m = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), best, 1.0)
+        return cv2.warpAffine(img, m, (w, h), flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255))
     except Exception:  # noqa: BLE001
         return img
 
 
-def _shadow_remove(img):
-    """Flatten uneven lighting/shadows to a clean white background while preserving
-    color (red stamps survive) — the 'scan look'. Background is estimated per channel
-    on a downscaled copy for speed, then applied at full resolution."""
-    h, w = img.shape[:2]
-    scale = 1400.0 / max(h, w) if max(h, w) > 1400 else 1.0
-    out = []
-    for ch in cv2.split(img):
-        src = cv2.resize(ch, (max(1, int(w * scale)), max(1, int(h * scale)))) if scale < 1 else ch
-        dil = cv2.dilate(src, np.ones((7, 7), np.uint8))
-        bg = cv2.medianBlur(dil, 21)
-        if scale < 1:
-            bg = cv2.resize(bg, (w, h))
-        diff = 255 - cv2.absdiff(ch, bg)
-        out.append(cv2.normalize(diff, None, 0, 255, cv2.NORM_MINMAX))
-    return cv2.merge(out)
+def _estimate_background(lum):
+    """Large-scale illumination field of a luminance image. Estimated on a 1/4-size copy
+    (a big blur there ≈ a huge blur at full res, ~16x cheaper) then upsampled."""
+    h, w = lum.shape[:2]
+    sw, sh = max(1, w // 4), max(1, h // 4)
+    small = cv2.resize(lum, (sw, sh), interpolation=cv2.INTER_AREA)
+    k = max(3, (max(sw, sh) // 3) | 1)
+    bg = cv2.GaussianBlur(small, (k, k), 0)
+    return cv2.resize(bg, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def _scan_color(img, bright, contrast):
+    """The 'scan look', smooth (not bilevel) and hue-preserving:
+      1) flatten uneven lighting by DIVIDING luminance by its background field, so paper
+         normalizes to white regardless of shadow/gradient (multiplicative model);
+      2) a tone curve deepens ink toward black and clips paper to pure white while keeping
+         gradients, so edges stay anti-aliased (no jaggies);
+      3) recolor by scaling B/G/R with the same per-pixel luminance gain, which preserves
+         hue & saturation — red stamps stay red, they don't get blackened.
+    """
+    b, g, r = cv2.split(img.astype(np.float32))
+    lum = 0.114 * b + 0.587 * g + 0.299 * r
+    bg = np.maximum(_estimate_background(lum), 1.0)
+    flat = np.clip(lum / bg, 0.0, 1.3)                     # paper -> ~1.0, ink -> low
+
+    pivot = 0.80 - contrast / 500.0                        # below pivot darkens, above whitens
+    strength = 2.4 + contrast / 40.0
+    new_lum = np.clip((flat - pivot) * strength + 1.0, 0.0, 1.0) * 255.0 + float(bright)
+    new_lum = np.clip(new_lum, 0.0, 255.0)
+
+    gain = np.clip(new_lum / np.maximum(lum, 1.0), 0.0, 4.0)
+    out = cv2.merge([np.clip(b * gain, 0, 255),
+                     np.clip(g * gain, 0, 255),
+                     np.clip(r * gain, 0, 255)]).astype(np.float32)
+
+    # Neutralize the paper: bright + low-chroma pixels are blended toward pure white,
+    # killing any residual color cast so the background reads as true white. Keyed on the
+    # MIN channel, so saturated ink (red stamp = low B/G) and dark text are left alone.
+    mn = out.min(axis=2)
+    wpaper = np.clip((mn - 185.0) / 55.0, 0.0, 1.0)[..., None]
+    out = out * (1.0 - wpaper) + 255.0 * wpaper
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _sauvola_mask(gray, window=25, k=0.2, r=128.0):
+    """Sauvola local binarization via integral images (cv2.boxFilter); no scikit-image.
+    Returns a bool mask, True where the pixel is INK (below the local adaptive threshold)."""
+    g = gray.astype(np.float32)
+    win = (window, window)
+    mean = cv2.boxFilter(g, -1, win, normalize=True, borderType=cv2.BORDER_REPLICATE)
+    sqmean = cv2.boxFilter(g * g, -1, win, normalize=True, borderType=cv2.BORDER_REPLICATE)
+    std = cv2.sqrt(np.maximum(sqmean - mean * mean, 0.0))
+    thresh = mean * (1.0 + k * (std / r - 1.0))
+    return g < thresh
+
+
+def _red_mask(img):
+    """Red-stamp pixels in BGR (robust to lighting): red channel clearly above green & blue.
+    Cheaper and far more reliable than a fixed LAB window, which clips saturated reds."""
+    b, g, r = cv2.split(img.astype(np.int16))
+    m = ((r - g > 40) & (r - b > 40) & (r > 80)).astype(np.uint8) * 255
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    return cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
 
 
 def _enhance(img, bright, contrast, detail, enhance_mode):
-    out = img
-    if enhance_mode == 0:
-        # scan look: flatten background, then STRONG contrast (text->black, bg->white),
-        # pivoting around mid-gray so text darkens and background whitens; color kept.
-        out = _shadow_remove(out)
-        alpha = 1.7 + (contrast / 100.0)
-        beta = -100.0 + float(bright)
-    else:
-        alpha = 1.0 + (contrast / 100.0)
-        beta = float(bright)
-    out = cv2.convertScaleAbs(out, alpha=alpha, beta=beta)
+    """enhanceMode: 0=color scan (default), 1=grayscale, 2=binarized B/W,
+    3=binarized but red stamps kept in color."""
+    out = _scan_color(img, bright, contrast)
+
     # detail / sharpen via unsharp mask (-1 = auto mild)
     amount = 0.6 if detail == -1 else max(0.0, detail / 100.0)
     if amount > 0:
         blur = cv2.GaussianBlur(out, (0, 0), 3)
         out = cv2.addWeighted(out, 1 + amount, blur, -amount, 0)
-    # enhanceMode: 0=color, 1=grayscale, 2=binarized scan (white background)
+
     if enhance_mode == 1:
         g = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
         out = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
-    elif enhance_mode == 2:
-        g = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
-        g = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                  cv2.THRESH_BINARY, 25, 15)
-        out = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+    elif enhance_mode in (2, 3):
+        gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+        win = max(15, (min(gray.shape[:2]) // 40) | 1)
+        ink = _sauvola_mask(gray, window=win, k=0.2)
+        bw = np.full_like(out, 255)
+        bw[ink] = (0, 0, 0)
+        if enhance_mode == 3:                              # keep red stamps in original color
+            stamp = (_red_mask(img) > 0)
+            bw[stamp] = img[stamp]
+        out = bw
     return out
 
 
