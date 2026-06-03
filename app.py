@@ -506,6 +506,31 @@ def _docaligner_corners(img):
         return None
 
 
+def _near_rect_box(quad):
+    """If the quad is essentially a ROTATED RECTANGLE (flat-on page, only tilted — opposite
+    sides nearly equal in length and corners near 90°), return its best-fit rectangle's
+    corners. Warping from THAT is a pure rotation (rigid: levels the text with no shear),
+    instead of a homography that would stretch/shear the text — including the spurious shear
+    that slightly-off detected corners introduce even on a flat page. Returns None when the
+    quad has real perspective (keystone), where an actual unprojection is needed."""
+    tl, tr, br, bl = quad
+    w_top = np.linalg.norm(tr - tl); w_bot = np.linalg.norm(br - bl)
+    h_left = np.linalg.norm(bl - tl); h_right = np.linalg.norm(br - tr)
+    wr = min(w_top, w_bot) / max(w_top, w_bot, 1.0)
+    hr = min(h_left, h_right) / max(h_left, h_right, 1.0)
+
+    def corner_angle(a, b, c):
+        u, v = a - b, c - b
+        cos = float(np.dot(u, v) / (np.linalg.norm(u) * np.linalg.norm(v) + 1e-6))
+        return np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))
+
+    max_dev = max(abs(corner_angle(bl, tl, tr) - 90), abs(corner_angle(tl, tr, br) - 90),
+                  abs(corner_angle(tr, br, bl) - 90), abs(corner_angle(br, bl, tl) - 90))
+    if wr >= 0.93 and hr >= 0.93 and max_dev <= 7.0:
+        return _order_quad(cv2.boxPoints(cv2.minAreaRect(quad.astype("float32"))))
+    return None
+
+
 def _rectify_document(img):
     """Crop + deskew. Tiered:
       1) learned corner detector (DocAligner) — best on same-color / perspective
@@ -530,6 +555,12 @@ def _rectify_document(img):
             quad = _quad_corners(contour)
 
     quad = (quad / scale).astype("float32")
+    # Flat-on but tilted page -> snap to its best-fit rectangle so the warp is a pure rotation
+    # (no text shear); keep the raw quad only for genuine perspective (keystone) shots.
+    box = _near_rect_box(quad)
+    print(f"[rectify] near_rect_snap={box is not None}", flush=True)
+    if box is not None:
+        quad = box
     warped = _warp_quad(img, quad)
     return warped if warped is not None and _plausible(warped, w, h) else None
 
