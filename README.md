@@ -63,7 +63,13 @@ bash scripts/install.sh          # paddle, paddlex, fastapi, rembg, onnxruntime-
 # then fetch the DocAligner weights — see models/README.md
 bash scripts/start.sh            # serves on 0.0.0.0:6006
 nohup bash scripts/watchdog.sh >/dev/null 2>&1 &   # optional keep-alive
+
+python3 scripts/selftest.py --table --text *.jpg   # OCR quality A/B: original vs enhanced
 ```
+
+`scripts/selftest.py` runs each image through `/v1/doc-correct` then OCRs the original
+and the enhanced result side by side (lines / confidence / latency), and optionally checks
+`/v1/table` — a quick regression/quality harness (pure stdlib, point `--base` at the box).
 
 Requires an NVIDIA GPU. `scripts/start.sh` exports `LD_LIBRARY_PATH` so onnxruntime-gpu
 finds paddle's bundled CUDA/cuDNN libs. The DocAligner weights path is configurable via
