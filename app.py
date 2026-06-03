@@ -26,6 +26,17 @@ from paddlex import create_pipeline, create_model
 
 app = FastAPI(title="OmniX OCR Backend (PaddleX)", version="1.0.0")
 
+# Cap OpenCV's CPU thread pool so concurrent requests don't oversubscribe a many-core box
+# (each cv2 call would otherwise grab a large default pool). Tunable via env.
+cv2.setNumThreads(int(os.environ.get("DOCRECT_CV_THREADS", "6")))
+
+# Long-side pixel caps. Documents OCR fine at ~150-200 DPI; feeding full-res photos (e.g.
+# 6 MP) explodes the CPU pre/post-processing AND lowers OCR accuracy (the models work at a
+# normal scale internally). We downscale for inference and scale coordinates back to the
+# original resolution, so the external contract is unchanged.
+_OCR_MAXSIDE = int(os.environ.get("DOCRECT_OCR_MAXSIDE", "2048"))
+_DOC_MAXSIDE = int(os.environ.get("DOCRECT_DOC_MAXSIDE", "2560"))
+
 DEVICE = "gpu:0"
 _OCR = None
 _TABLE = None
@@ -73,6 +84,29 @@ async def _read_bgr(request: Request, file: Optional[UploadFile]):
     return img
 
 
+def _downscale(img, maxside):
+    """Shrink so the long side <= maxside (INTER_AREA). Returns (image, scale) with scale<=1
+    (1.0 when no resize was needed). Multiply result coordinates by 1/scale to map back."""
+    h, w = img.shape[:2]
+    if max(h, w) <= maxside:
+        return img, 1.0
+    scale = maxside / float(max(h, w))
+    return cv2.resize(img, (max(1, round(w * scale)), max(1, round(h * scale))),
+                      interpolation=cv2.INTER_AREA), scale
+
+
+def _scale_nested(obj, f):
+    """Multiply every numeric leaf of a nested coordinate list by f (rounded to int); pass
+    anything else through. Maps inference-space boxes back to original-image pixels."""
+    if isinstance(obj, list):
+        return [_scale_nested(x, f) for x in obj]
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, (int, float)):
+        return int(round(obj * f))
+    return obj
+
+
 # ----------------------------------------------------------------------------
 # Health
 # ----------------------------------------------------------------------------
@@ -91,10 +125,12 @@ async def ocr(request: Request, file: Optional[UploadFile] = File(None)):
     if img is None:
         return JSONResponse({"error": "empty image"}, status_code=400)
     h, w = img.shape[:2]
+    proc, scale = _downscale(img, _OCR_MAXSIDE)   # OCR at a sane resolution (speed + accuracy)
+    inv = 1.0 / scale
     ocr_pl, _, _ = _pipelines()
 
     res = None
-    for r in ocr_pl.predict(img, return_word_box=True):
+    for r in ocr_pl.predict(proc, return_word_box=True):
         res = r.json["res"]
         break
 
@@ -109,12 +145,12 @@ async def ocr(request: Request, file: Optional[UploadFile] = File(None)):
         "doc_angle": doc_angle,
         "rec_texts": res.get("rec_texts", []),
         "rec_scores": res.get("rec_scores", []),
-        "rec_polys": res.get("rec_polys", []),          # per-line quad (4 pts x,y)
-        "rec_boxes": res.get("rec_boxes", []),           # axis-aligned [x1,y1,x2,y2]
-        "dt_polys": res.get("dt_polys", []),
+        "rec_polys": _scale_nested(res.get("rec_polys", []), inv),   # per-line quad (4 pts x,y)
+        "rec_boxes": _scale_nested(res.get("rec_boxes", []), inv),   # axis-aligned [x1,y1,x2,y2]
+        "dt_polys": _scale_nested(res.get("dt_polys", []), inv),
         "textline_orientation_angles": res.get("textline_orientation_angles", []),
         "text_word": res.get("text_word", []),           # per-line list of words (CJK = per char)
-        "text_word_boxes": res.get("text_word_boxes", []),  # per-line list of quad boxes
+        "text_word_boxes": _scale_nested(res.get("text_word_boxes", []), inv),  # per-line quad boxes
         "cost_ms": int((time.time() - t0) * 1000),
     }
     return JSONResponse(out)
@@ -158,10 +194,12 @@ async def table(request: Request, file: Optional[UploadFile] = File(None)):
     if img is None:
         return JSONResponse({"error": "empty image"}, status_code=400)
     h, w = img.shape[:2]
+    proc, scale = _downscale(img, _OCR_MAXSIDE)   # recognise at a sane resolution
+    inv = 1.0 / scale
     _, table_pl, table_cls = _pipelines()
 
     res = None
-    for r in table_pl.predict(img):
+    for r in table_pl.predict(proc):
         res = r.json["res"]
         break
 
@@ -169,13 +207,13 @@ async def table(request: Request, file: Optional[UploadFile] = File(None)):
     for t in (res.get("table_res_list") or []):
         cells = t.get("cell_box_list") or []
         region = _region_from_cells(cells)
-        label, score = _classify_table(table_cls, img, region)
+        label, score = _classify_table(table_cls, proc, region)   # classify in proc space
         tables.append({
             "type": label,                # 'wired_table' | 'wireless_table' | 'unknown'
             "type_score": score,
-            "region": region,             # [x1,y1,x2,y2] hull of cells
+            "region": _scale_nested(region, inv) if region else region,
             "pred_html": t.get("pred_html", ""),
-            "cell_box_list": cells,       # [[x1,y1,x2,y2], ...] (HTML <td> order)
+            "cell_box_list": _scale_nested(cells, inv),  # [[x1,y1,x2,y2], ...] (HTML <td> order)
         })
 
     overall = res.get("overall_ocr_res") or {}
@@ -185,7 +223,7 @@ async def table(request: Request, file: Optional[UploadFile] = File(None)):
         layout.append({
             "label": b.get("label"),
             "score": b.get("score"),
-            "coordinate": b.get("coordinate"),
+            "coordinate": _scale_nested(b.get("coordinate"), inv),
         })
 
     out = {
@@ -195,8 +233,8 @@ async def table(request: Request, file: Optional[UploadFile] = File(None)):
         "overall_ocr": {
             "rec_texts": overall.get("rec_texts", []),
             "rec_scores": overall.get("rec_scores", []),
-            "rec_polys": overall.get("rec_polys", []),
-            "rec_boxes": overall.get("rec_boxes", []),
+            "rec_polys": _scale_nested(overall.get("rec_polys", []), inv),
+            "rec_boxes": _scale_nested(overall.get("rec_boxes", []), inv),
         },
         "layout": layout,
         "cost_ms": int((time.time() - t0) * 1000),
@@ -903,6 +941,11 @@ async def doc_correct(
     img = await _read_bgr(request, file)
     if img is None:
         return JSONResponse({"error": "empty image"}, status_code=400)
+
+    # Cap the working resolution: the whole rectify/deskew/deblur/enhance chain is CPU-bound
+    # (OpenCV/numpy) and scales with pixel count; a ~2.5k-px scan is plenty and keeps the
+    # heaviest step (Richardson-Lucy deblur) cheap. This is the single biggest CPU saver.
+    img, _ = _downscale(img, _DOC_MAXSIDE)
 
     # 1) document detection: crop + deskew (scan_m == 0 disables auto-crop)
     if scan_m != 0:
