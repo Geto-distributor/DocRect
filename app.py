@@ -544,12 +544,14 @@ def _deskew_textlines(img):
     try:
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         h, w = gray.shape[:2]
-        s = 1000.0 / max(h, w) if max(h, w) > 1000 else 1.0
+        s = 900.0 / max(h, w) if max(h, w) > 900 else 1.0
         small = cv2.resize(gray, (max(1, round(w * s)), max(1, round(h * s))),
                            interpolation=cv2.INTER_AREA) if s < 1.0 else gray
-        _, th = cv2.threshold(small, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        # project a Sauvola TEXT mask (not OTSU): excludes stamps / table fills / residual
+        # shadow that would otherwise bias the variance toward a false peak.
+        th = _sauvola_mask(small, window=25, k=0.2).astype(np.uint8) * 255
         th = cv2.medianBlur(th, 3)
-        if cv2.countNonZero(th) < 50:
+        if cv2.countNonZero(th) < 30:
             return img
         sh, sw = th.shape[:2]
         center = (sw / 2.0, sh / 2.0)
@@ -560,12 +562,13 @@ def _deskew_textlines(img):
             proj = np.sum(rot, axis=1, dtype=np.float64)
             return float(np.var(proj))
 
-        coarse = np.arange(-4.0, 4.001, 0.4)
+        coarse = np.arange(-5.0, 5.001, 0.2)              # fine coarse step so the peak isn't missed
         best = max(coarse, key=variance_at)
-        fine = np.arange(best - 0.4, best + 0.401, 0.05)
+        fine = np.arange(best - 0.6, best + 0.601, 0.02)  # 0.02 deg ~ 1px across a 3000px page
         best = float(max(fine, key=variance_at))
-        if abs(best) < 0.1 or abs(best) > 8.0:   # already level, or implausible -> skip
+        if abs(best) < 0.02 or abs(best) > 10.0:          # already level, or implausible -> skip
             return img
+        print(f"[deskew] angle={best:.3f} deg", flush=True)
         m = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), best, 1.0)
         return cv2.warpAffine(img, m, (w, h), flags=cv2.INTER_CUBIC, borderValue=(255, 255, 255))
     except Exception:  # noqa: BLE001
@@ -665,20 +668,22 @@ def _enhance(img, bright, contrast, detail, enhance_mode):
         g = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
         out = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
     elif enhance_mode in (2, 3):
+        # Conservative binarization: stroke weight is decided ONLY by the Sauvola threshold.
+        # High k commits just confidently-dark pixels, so smudges / bleed-through stay white;
+        # NO pre-sharpen and NO morphological close, so glyphs are neither thickened nor
+        # thinned (the earlier aggressive version ate smudges into black speckle).
         gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
-        # consolidate strokes before thresholding: fill tiny intra-stroke holes, then denoise
-        gray = cv2.morphologyEx(gray, cv2.MORPH_CLOSE,
-                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2)))
-        gray = cv2.GaussianBlur(gray, (0, 0), 1.0)
-        # larger window = steadier local background; lower k = catch faint gray as ink
-        win = max(31, (min(gray.shape[:2]) // 30) | 1)
-        ink = _sauvola_mask(gray, window=win, k=0.15).astype(np.uint8) * 255
-        ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))  # fill pinholes
-        ink = cv2.medianBlur(ink, 3)                                            # drop speckle
-        mask = ink > 0
+        win = max(31, (min(gray.shape[:2]) // 40) | 1)
+        ink = _sauvola_mask(gray, window=win, k=0.25).astype(np.uint8)
+        # drop isolated specks by connected-component area (vectorized one pass)
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
+        min_area = max(4, (ink.shape[0] * ink.shape[1]) // 400000)
+        keep = stats[:, cv2.CC_STAT_AREA] >= min_area
+        keep[0] = False                                    # label 0 is the background
         bw = np.full_like(out, 255)
-        bw[mask] = (0, 0, 0)
-        if enhance_mode == 3:                              # keep red stamps in original color
+        bw[keep[labels]] = (0, 0, 0)
+        bw = cv2.GaussianBlur(bw, (0, 0), 0.6)             # symmetric anti-alias (no weight bias)
+        if enhance_mode == 3:                              # overlay red stamps from the original (crisp)
             stamp = (_red_mask(img) > 0)
             bw[stamp] = img[stamp]
         out = bw
