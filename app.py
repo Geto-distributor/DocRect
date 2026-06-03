@@ -42,6 +42,25 @@ _DOC_MAXSIDE = int(os.environ.get("DOCRECT_DOC_MAXSIDE", "2560"))
 # perspective better). Off by default; orientation + textline-orientation stay on.
 _OCR_USE_UNWARP = os.environ.get("DOCRECT_OCR_UNWARP", "0") == "1"
 
+# GPU-accelerate the scan-enhancement arithmetic with cupy (the ~40 full-res numpy passes in
+# _scan_color are memory-bandwidth-bound on CPU; on GPU they're ~20x faster). Falls back to
+# CPU automatically if cupy/GPU is unavailable or errors. Disable with DOCRECT_GPU=0.
+_USE_GPU = os.environ.get("DOCRECT_GPU", "1") != "0"
+_CUPY = None
+
+
+def _cupy():
+    """Lazy cupy handle: the module if a GPU array op works, else False (-> CPU path)."""
+    global _CUPY
+    if _CUPY is None:
+        try:
+            import cupy as cp
+            int((cp.zeros(1, cp.float32) + 1).sum())   # touch the GPU
+            _CUPY = cp
+        except Exception:  # noqa: BLE001
+            _CUPY = False
+    return _CUPY
+
 DEVICE = "gpu:0"
 _OCR = None
 _TABLE = None
@@ -668,6 +687,65 @@ def _estimate_background(lum):
 
 
 def _scan_color(img, bright, contrast):
+    """Dispatch the scan enhancement to GPU (cupy) when available, else CPU. Identical
+    math; the GPU path just runs the heavy per-pixel arithmetic on the device."""
+    if _USE_GPU and _cupy():
+        try:
+            return _scan_color_gpu(img, bright, contrast)
+        except Exception:  # noqa: BLE001 — any GPU/cupy hiccup falls back to CPU
+            pass
+    return _scan_color_cpu(img, bright, contrast)
+
+
+def _scan_color_gpu(img, bright, contrast):
+    """cupy port of _scan_color_cpu: the per-pixel arithmetic runs on the GPU. The few
+    cv2-only steps (background estimate, CLAHE, LAB a*, final HSV saturation) stay on CPU
+    so the output is bit-for-bit comparable; only small arrays cross the PCIe bus."""
+    cp = _cupy()
+    imgf = img.astype(np.float32)
+    lum_cpu = 0.114 * imgf[..., 0] + 0.587 * imgf[..., 1] + 0.299 * imgf[..., 2]
+    bg_cpu = np.maximum(_estimate_background(lum_cpu), 1.0)               # cv2 resize+blur (CPU)
+    a_red_cpu = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[..., 1].astype(np.float32)  # cv2 (CPU)
+
+    gimg = cp.asarray(imgf)
+    b, g, r = gimg[..., 0], gimg[..., 1], gimg[..., 2]
+    lum = cp.asarray(lum_cpu)
+    flat = cp.clip(lum / cp.asarray(bg_cpu), 0.0, 1.3)
+    chroma0 = gimg.max(axis=2) - gimg.min(axis=2)
+    bg_mask = (flat > 0.90) & (chroma0 < 40.0)
+
+    f8 = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(      # CLAHE (CPU)
+        cp.asnumpy(cp.clip(flat * 200.0, 0, 255).astype(cp.uint8)))
+    flat = cp.asarray(f8.astype(np.float32) / 200.0)
+
+    pivot = 0.70 - contrast / 500.0
+    strength = 3.6 + contrast / 40.0
+    new_lum = cp.clip(cp.clip((flat - pivot) * strength + 1.0, 0.0, 1.0) * 255.0 + float(bright), 0.0, 255.0)
+
+    colorness = cp.clip((cp.asarray(a_red_cpu) - 138.0) / 30.0, 0.0, 1.0)
+    is_seal_ink = cp.clip((lum - 70.0) / 40.0, 0.0, 1.0)
+    lift = colorness * is_seal_ink
+    lum_keep = cp.clip(lum * 1.2 + 45.0, 0.0, 255.0)
+    new_lum = new_lum * (1.0 - lift) + lum_keep * lift
+
+    gain = cp.clip(new_lum / cp.maximum(lum, 1.0), 0.0, 4.0)
+    out = cp.stack([cp.clip(b * gain, 0, 255), cp.clip(g * gain, 0, 255), cp.clip(r * gain, 0, 255)], axis=2)
+
+    mx = out.max(axis=2); mn = out.min(axis=2)
+    lum2 = 0.114 * out[..., 0] + 0.587 * out[..., 1] + 0.299 * out[..., 2]
+    brightw = cp.clip((lum2 - 185.0) / 55.0, 0.0, 1.0)
+    achroma = cp.clip((60.0 - (mx - mn)) / 60.0, 0.0, 1.0)
+    wpaper = (brightw * achroma)[..., None]
+    out = out * (1.0 - wpaper) + 255.0 * wpaper
+    out[bg_mask] = 255.0
+    out = cp.asnumpy(cp.clip(out, 0, 255).astype(cp.uint8))
+
+    hsv = cv2.cvtColor(out, cv2.COLOR_BGR2HSV).astype(np.float32)        # HSV saturation (CPU)
+    hsv[..., 1] = np.clip(hsv[..., 1] * 1.85, 0.0, 255.0)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+
+def _scan_color_cpu(img, bright, contrast):
     """The 'scan look', smooth (not bilevel) and hue-preserving:
       1) flatten uneven lighting by DIVIDING luminance by its background field, so paper
          normalizes to white regardless of shadow/gradient (multiplicative model);
