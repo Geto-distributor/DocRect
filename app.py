@@ -655,17 +655,21 @@ def _sauvola_mask(gray, window=25, k=0.2, r=128.0):
 
 
 def _red_mask(img):
-    """Red-stamp pixels in BGR (robust to lighting): red channel clearly above green & blue.
-    Cheaper and far more reliable than a fixed LAB window, which clips saturated reds."""
-    b, g, r = cv2.split(img.astype(np.int16))
-    m = ((r - g > 40) & (r - b > 40) & (r > 80)).astype(np.uint8) * 255
-    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-    return cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    """Red ink (seal + red handwriting) via HSV hue. Robust to DARK / low-saturation reds
+    that a raw BGR channel-difference test misses: a photographed stamp can be dark red
+    (R~80, B~50) where r-b is only ~30, but its hue is unmistakably red."""
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    # generous saturation floor so the seal's lighter / anti-aliased red is included; NO open
+    # (it erodes the thin stamp strokes away), then close + dilate to cover the full stroke halo.
+    m = (((h <= 12) | (h >= 168)) & (s >= 45) & (v >= 50)).astype(np.uint8) * 255
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))  # bridge the ring's strokes
+    return cv2.dilate(m, np.ones((3, 3), np.uint8))                      # cover the anti-aliased halo
 
 
-def _enhance(img, bright, contrast, detail, enhance_mode):
-    """enhanceMode: 0=color scan (default), 1=grayscale, 2=binarized B/W,
-    3=binarized but red stamps kept in color."""
+def _enhance(img, bright, contrast, detail, enhance_mode, remove_red=False):
+    """enhanceMode: 0=color scan (default), 1=grayscale, 2=binarized B/W, 3=binarized + red
+    stamp kept. removeStamp=1 whitens all red ink (seal + red handwriting) in any mode."""
     out = _scan_color(img, bright, contrast)
 
     # detail / sharpen via unsharp mask (-1 = auto mild)
@@ -674,18 +678,22 @@ def _enhance(img, bright, contrast, detail, enhance_mode):
         blur = cv2.GaussianBlur(out, (0, 0), 3)
         out = cv2.addWeighted(out, 1 + amount, blur, -amount, 0)
 
+    red = _red_mask(img) > 0
+    if remove_red:
+        out[red] = 255          # whiten red BEFORE binarizing, so the seal can't become black ink
+
     if enhance_mode == 1:
         g = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
         out = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
     elif enhance_mode in (2, 3):
-        # Conservative binarization: stroke weight is decided ONLY by the Sauvola threshold.
-        # High k commits just confidently-dark pixels, so smudges / bleed-through stay white;
-        # NO pre-sharpen and NO morphological close, so glyphs are neither thickened nor
-        # thinned (the earlier aggressive version ate smudges into black speckle).
+        # Binarize on the (already background-cleaned) scan. k=0.20 commits faint strokes so
+        # they stay connected; a light close bridges 1px gaps for stroke continuity. The
+        # upstream background whitening removed the smudges that used to turn into speckle,
+        # so this stays clean despite the looser k. CC-area filter drops isolated dust.
         gray = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
         win = max(31, (min(gray.shape[:2]) // 40) | 1)
-        ink = _sauvola_mask(gray, window=win, k=0.25).astype(np.uint8)
-        # drop isolated specks by connected-component area (vectorized one pass)
+        ink = _sauvola_mask(gray, window=win, k=0.20).astype(np.uint8)
+        ink = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, np.ones((2, 2), np.uint8))  # bridge stroke gaps
         n, labels, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
         min_area = max(4, (ink.shape[0] * ink.shape[1]) // 400000)
         keep = stats[:, cv2.CC_STAT_AREA] >= min_area
@@ -693,10 +701,10 @@ def _enhance(img, bright, contrast, detail, enhance_mode):
         bw = np.full_like(out, 255)
         bw[keep[labels]] = (0, 0, 0)
         bw = cv2.GaussianBlur(bw, (0, 0), 0.6)             # symmetric anti-alias (no weight bias)
-        if enhance_mode == 3:                              # overlay red stamps from the original (crisp)
-            stamp = (_red_mask(img) > 0)
-            bw[stamp] = img[stamp]
         out = bw
+
+    if not remove_red and enhance_mode == 3:               # overlay crisp red stamp from original
+        out[red] = img[red]
     return out
 
 
@@ -738,6 +746,7 @@ async def doc_correct(
     detail: int = Query(-1),
     enhance_mode: int = Query(0, alias="enhanceMode"),
     unwarp: int = Query(0),  # 1 = enable UVDoc dewarp (only for curved-page photos)
+    remove_red: int = Query(0, alias="removeStamp"),  # 1 = whiten red ink (seal + red handwriting)
 ):
     img = await _read_bgr(request, file)
     if img is None:
@@ -759,7 +768,7 @@ async def doc_correct(
     img = _deskew_textlines(img)
 
     # 3) photometric enhancement
-    img = _enhance(img, bright, contrast, detail, enhance_mode)
+    img = _enhance(img, bright, contrast, detail, enhance_mode, remove_red=bool(remove_red))
 
     ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
     if not ok:
