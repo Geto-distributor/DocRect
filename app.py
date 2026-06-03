@@ -689,6 +689,25 @@ def _red_mask(img):
     return cv2.dilate(m, np.ones((3, 3), np.uint8))
 
 
+def _seal_disc(red_mask, shape):
+    """Solid fill of LARGE circular stamp blobs, so the whole seal area can be wiped clean —
+    its dark maroon core (missed by the red mask) and the black text it overlaps included, so
+    no boundary ghost is left. Thin red marks (signatures, red dates) form small components
+    and are excluded, so they survive. Empty mask if no seal-sized blob is present."""
+    h, w = shape[:2]
+    minside = min(h, w)
+    k = max(21, (minside // 20) | 1)
+    closed = cv2.morphologyEx(red_mask, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
+    n, labels, stats, _ = cv2.connectedComponentsWithStats((closed > 0).astype(np.uint8), connectivity=8)
+    disc = np.zeros((h, w), np.uint8)
+    for i in range(1, n):
+        if min(stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]) >= 0.10 * minside:
+            disc[labels == i] = 255                       # seal-sized blob (not a thin stroke)
+    cnts, _ = cv2.findContours(disc, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    cv2.drawContours(disc, cnts, -1, 255, thickness=cv2.FILLED)  # ring -> solid disc
+    return disc
+
+
 def _enhance(img, bright, contrast, detail, enhance_mode, remove_red=False):
     """enhanceMode: 0=color scan (default), 1=grayscale, 2=binarized B/W, 3=binarized + red
     stamp kept. removeStamp=1 whitens all red ink (seal + red handwriting) in any mode."""
@@ -700,9 +719,14 @@ def _enhance(img, bright, contrast, detail, enhance_mode, remove_red=False):
         blur = cv2.GaussianBlur(out, (0, 0), 3)
         out = cv2.addWeighted(out, 1 + amount, blur, -amount, 0)
 
-    red = _red_mask(img) > 0
+    red_mask = _red_mask(img)
+    red = red_mask > 0
     if remove_red:
-        out[red] = 255          # whiten red BEFORE binarizing, so the seal can't become black ink
+        # Wipe the SEAL clean: fill its whole circular region with white (covers the dark core
+        # + overlapped black text the red mask misses -> no boundary ghost). Done BEFORE
+        # binarizing so the seal can't become black ink. Thin red strokes (signature, red
+        # dates) aren't seal-sized, so they're kept.
+        out[_seal_disc(red_mask, img.shape) > 0] = 255
 
     if enhance_mode == 1:
         g = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
