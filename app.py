@@ -758,6 +758,38 @@ def _unwarp(img):
     return img
 
 
+_DEBLUR_FOCUS_THRESHOLD = float(os.environ.get("DOCRECT_DEBLUR_FOCUS", "800"))
+
+
+def _focus_measure(gray):
+    """Variance of the Laplacian — high = sharp, low = soft/defocused. Computed on a
+    downscaled copy so the value is roughly resolution-independent (a sharp text page
+    scores high regardless of megapixels)."""
+    h, w = gray.shape[:2]
+    s = 1000.0 / max(h, w) if max(h, w) > 1000 else 1.0
+    g = cv2.resize(gray, (max(1, round(w * s)), max(1, round(h * s))),
+                   interpolation=cv2.INTER_AREA) if s < 1.0 else gray
+    return float(cv2.Laplacian(g, cv2.CV_64F).var())
+
+
+def _deblur(img, sigma=1.1, iters=6):
+    """Richardson-Lucy deconvolution on the L (luminance) channel: a classical maximum-
+    likelihood deconvolution that INVERTS a Gaussian (defocus) blur to restore edge
+    sharpness. It recovers detail from the measured blur model — it does NOT hallucinate
+    content the way a learned SR/GAN would, so it is safe for legal documents. Runs on L
+    only (chroma kept) to avoid colour ringing; background overshoot is later clipped to
+    white by the scan enhancement."""
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    obs = np.clip(lab[..., 0].astype(np.float32) / 255.0, 1e-4, 1.0)
+    est = obs.copy()
+    for _ in range(max(1, iters)):
+        conv = cv2.GaussianBlur(est, (0, 0), sigma)
+        est = est * cv2.GaussianBlur(obs / (conv + 1e-6), (0, 0), sigma)
+        est = np.clip(est, 0.0, 1.0)
+    lab[..., 0] = np.clip(est * 255.0, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+
 @app.post("/v1/doc-correct")
 async def doc_correct(
     request: Request,
@@ -769,6 +801,7 @@ async def doc_correct(
     enhance_mode: int = Query(0, alias="enhanceMode"),
     unwarp: int = Query(0),  # 1 = enable UVDoc dewarp (only for curved-page photos)
     remove_red: int = Query(0, alias="removeStamp"),  # 1 = whiten red ink (seal + red handwriting)
+    deblur: int = Query(-1),  # -1 = auto (deblur only when the page is soft), 0 = off, 1 = force on
 ):
     img = await _read_bgr(request, file)
     if img is None:
@@ -788,6 +821,15 @@ async def doc_correct(
 
     # 2.5) fine residual text-line deskew (make lines truly horizontal)
     img = _deskew_textlines(img)
+
+    # 2.6) deblur (Richardson-Lucy): auto -> only when the page is soft/defocused, so sharp
+    # captures aren't over-sharpened into ringing. Recovers detail without hallucinating.
+    if deblur != 0:
+        focus = _focus_measure(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+        apply_deblur = deblur == 1 or (deblur == -1 and focus < _DEBLUR_FOCUS_THRESHOLD)
+        print(f"[deblur] focus={focus:.0f} threshold={_DEBLUR_FOCUS_THRESHOLD:.0f} applied={apply_deblur}", flush=True)
+        if apply_deblur:
+            img = _deblur(img)
 
     # 3) photometric enhancement
     img = _enhance(img, bright, contrast, detail, enhance_mode, remove_red=bool(remove_red))

@@ -38,15 +38,20 @@ packages, and screenshots alike — and **never clips content**:
    mask (rembg), pick the most rectangular; masks are spike-cleaned (morphological open).
 4. Perspective warp → orientation (0/90/180/270) → **text-line deskew** (maximize the
    horizontal-projection variance of the ink map over small angles — a whole-page
-   statistic, robust where a `minAreaRect` on dark pixels drifts) →
-   **scan enhancement**: divide luminance by its background field to flatten shadows
-   (paper → white), a tone curve that deepens ink and clips paper to pure white while
-   keeping gradients (anti-aliased, no jaggies), hue-preserving recolor + near-white
-   neutralization so the background is true white and **red stamps survive**.
+   statistic, robust where a `minAreaRect` on dark pixels drifts) → **deblur** (auto:
+   Richardson-Lucy deconvolution on luminance, only when the page is soft — classical,
+   no hallucination) → **scan enhancement**: divide luminance by its background field to
+   flatten shadows (paper → white), a tone curve that deepens ink and clips paper to pure
+   white while keeping gradients (anti-aliased, no jaggies), hue-preserving recolor +
+   near-white neutralization so the background is true white and **red stamps survive**.
 5. No document found → enhance only (never distorts).
 
-`enhanceMode`: `0` color scan (default) · `1` grayscale · `2` binarized B/W (Sauvola,
-integral-image — no scikit-image) · `3` binarized but red stamps kept in color.
+Query params: `enhanceMode` `0` color scan (default) · `1` grayscale · `2` binarized B/W
+(Sauvola, integral-image — no scikit-image) · `3` binarized but red stamps kept in color.
+`removeStamp=1` whitens red ink (seal + red handwriting). `deblur` `-1` auto (default,
+deconvolve only soft pages) · `0` off · `1` force. `bright` / `contrast` / `detail` tune
+brightness / ink darkness / sharpening. `scan-m=0` disables auto-crop; `unwarp=1` enables
+UVDoc curved-page dewarp.
 
 Detection runs on a downscaled copy; the full-res image is warped once. Warm latency is
 sub-second to ~1s even on 24 MP photos (all inference on GPU).
