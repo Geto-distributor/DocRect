@@ -623,6 +623,14 @@ def _scan_color(img, bright, contrast):
     new_lum = np.clip((flat - pivot) * strength + 1.0, 0.0, 1.0) * 255.0 + float(bright)
     new_lum = np.clip(new_lum, 0.0, 255.0)
 
+    # Keep colored ink (red seal / signature) BRIGHT instead of darkening it like black text:
+    # the tone curve above would mud the stamp. LAB a* (red axis) flags red regardless of
+    # brightness, so for those pixels target a lifted luminance -> the seal stays vivid, not dark.
+    a_red = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)[..., 1].astype(np.float32)
+    colorness = np.clip((a_red - 138.0) / 30.0, 0.0, 1.0)
+    lum_keep = np.clip(lum * 1.15 + 45.0, 0.0, 255.0)
+    new_lum = new_lum * (1.0 - colorness) + lum_keep * colorness
+
     gain = np.clip(new_lum / np.maximum(lum, 1.0), 0.0, 4.0)
     out = cv2.merge([np.clip(b * gain, 0, 255),
                      np.clip(g * gain, 0, 255),
@@ -639,7 +647,14 @@ def _scan_color(img, bright, contrast):
     wpaper = (bright * achroma)[..., None]                 # whiten bright low-chroma paper only
     out = out * (1.0 - wpaper) + 255.0 * wpaper            # (slightly cyan/yellow paper -> white)
     out[bg_mask] = 255.0                                   # hard-whiten confident background: wipes
-    return np.clip(out, 0, 255).astype(np.uint8)           # haze / bleed-through / bag sheen
+    out = np.clip(out, 0, 255).astype(np.uint8)            # haze / bleed-through / bag sheen
+
+    # Vivid color (scan-app 'magic color' look): boost saturation so the red seal / signature
+    # pop. Neutral ink & paper have ~0 saturation, so black text and the white background are
+    # untouched — only genuinely colored pixels get more saturated.
+    hsv = cv2.cvtColor(out, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[..., 1] = np.clip(hsv[..., 1] * 1.85, 0.0, 255.0)
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
 
 
 def _sauvola_mask(gray, window=25, k=0.2, r=128.0):
